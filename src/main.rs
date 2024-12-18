@@ -1,5 +1,6 @@
 #![feature(never_type)]
 #![feature(let_chains)]
+#![feature(try_blocks)]
 
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar};
@@ -12,9 +13,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::str;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time;
 
 pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
   let mut cmd = Command::new(program);
@@ -22,7 +24,7 @@ pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
   cmd
 }
 
-fn video_frames(path: impl ToString) -> u64 {
+fn video_frames(path: &str) -> u64 {
   let output = command("ffprobe")
     .args([
       "-v",
@@ -34,7 +36,7 @@ fn video_frames(path: impl ToString) -> u64 {
       "stream=nb_read_frames",
       "-of",
       "default=nokey=1:noprint_wrappers=1",
-      path.to_string().as_str(),
+      path,
     ])
     .output()
     .unwrap();
@@ -42,7 +44,9 @@ fn video_frames(path: impl ToString) -> u64 {
   str::from_utf8(&output.stdout).unwrap_or("0").trim().parse().unwrap_or(0)
 }
 
-fn split_video(input: &str, parts: usize) -> Vec<String> {
+fn split_video(
+  input: &str, parts: usize,
+) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
   let duration_output = command("ffprobe")
     .args([
       "-i",
@@ -59,12 +63,14 @@ fn split_video(input: &str, parts: usize) -> Vec<String> {
   let duration: f64 =
     String::from_utf8_lossy(&duration_output.stdout).trim().parse().unwrap();
 
+  let frames = video_frames(input);
+
   let segment = duration / parts as f64;
 
-  let slice_part = |i| {
+  let slice_part = move |i| {
     let start = segment * i as f64;
-    let path = format!("{i}.y4m");
-    let _ = command("ffmpeg")
+
+    let output = command("ffmpeg")
       .args([
         "-y",
         "-i",
@@ -73,13 +79,15 @@ fn split_video(input: &str, parts: usize) -> Vec<String> {
         &start.to_string(),
         "-t",
         &segment.to_string(),
-        &path,
+        "-f",
+        "ismv",
+        "pipe:1",
       ])
       .output()
       .unwrap();
-    path
+    (frames / parts as u64, output.stdout)
   };
-  (0..parts).map(slice_part).collect::<Vec<_>>()
+  (0..parts).map(slice_part)
 }
 
 #[derive(Debug, Deserialize, Copy, Clone)]
@@ -91,42 +99,66 @@ pub enum Status {
 
 #[tokio::main]
 async fn main() {
-  let servers =
-    (0..4).map(|i| format!("http://127.0.0.1:3{i:03}")).collect::<Vec<_>>();
+  let server1 = (1, "http://127.0.0.1:3000");
+  let server2 = (1, "http://127.0.0.1:3001");
+  let servers = [server1, server2];
 
-  let path_parts = split_video("F:/Rust/av1r/zzz.mp4", servers.len());
-  let parts =
-    path_parts.iter().map(fs::read).collect::<io::Result<Vec<_>>>().unwrap();
+  let (frames, parts): (Vec<_>, Vec<_>) =
+    split_video("zzz.mp4", servers.len()).unzip();
 
   let instant = Instant::now();
 
   let (tx, mut rx) = mpsc::channel(32);
-  let (stx, mut srx) = watch::channel(None::<(usize, Status)>);
+  let (stx, mut srx) = watch::channel(None::<(u8, Status)>);
 
   let reqwest = Arc::new(Client::new());
-  for (i, (part, url)) in
+  for (i, (part, (threads, url))) in
     parts.into_iter().zip(servers.into_iter()).enumerate()
   {
-    let server = url.clone();
     let (tx, client) = (tx.clone(), reqwest.clone());
     tokio::spawn(async move {
-      let response =
-        client.post(format!("{server}/encode")).body(part).send().await?;
-      let bytes = response.bytes().await.unwrap();
-      tx.send((i, bytes)).await.unwrap();
-      Ok::<(), anyhow::Error>(())
+      let result: Result<()> = try {
+        let response = client
+          .post(format!("{url}/encode?idx={i}&threads={threads}"))
+          .body(part)
+          .send()
+          .await?;
+        let bytes = response.bytes().await?;
+        tx.send((i, bytes)).await.unwrap();
+      };
+      match result {
+        Ok(_) => {}
+        Err(err) => {
+          println!("{err:?}");
+        }
+      }
     });
 
-    let server = url.clone();
     let (stx, client) = (stx.clone(), reqwest.clone());
     tokio::spawn(async move {
       loop {
-        let res =
-          client.get(format!("{server}/status")).send().await?.json().await;
-        let _ = stx.send(res.ok().map(|res| (i, res)));
-      }
+        let mut wait = time::interval(Duration::from_millis(50));
 
-      Ok::<(), anyhow::Error>(())
+        let result: Result<_> = try {
+          wait.tick().await;
+
+          let status: (Option<u8>, Status) =
+            client.get(format!("{url}/status")).send().await?.json().await?;
+
+          status
+        };
+        match result {
+          Ok((idx, status)) => {
+            let _ = stx.send(idx.map(|idx| (idx, status)));
+            if let Status::Finish = status {
+              break;
+            }
+          }
+          Err(err) => {
+            println!("{err}");
+          }
+        }
+      }
     });
   }
   drop(tx);
@@ -134,13 +166,13 @@ async fn main() {
   let (closer, close) = oneshot::channel();
 
   let mut multi = MultiProgress::new();
-  let bars = path_parts
+  let bars = frames
     .into_iter()
-    .map(video_frames)
     .map(ProgressBar::new)
     .map(|bar| multi.add(bar))
     .collect::<Vec<_>>();
   thread::spawn(move || handle_bars(close, srx, bars));
+  multi.println("Encoding...").unwrap();
 
   let mut parts = Vec::new();
   while let Some((part, bytes)) = rx.recv().await {
@@ -148,6 +180,7 @@ async fn main() {
     parts.push(format!("{part}.ivf"));
   }
   let _ = closer.send(());
+  multi.clear().unwrap();
 
   let list = generate_file_list(&parts, "list.txt");
   let status = command("ffmpeg")
@@ -174,7 +207,7 @@ fn generate_file_list(files: &[String], list_file: &str) {
 
 fn handle_bars(
   mut close: oneshot::Receiver<()>,
-  srx: watch::Receiver<Option<(usize, Status)>>, mut bars: Vec<ProgressBar>,
+  srx: watch::Receiver<Option<(u8, Status)>>, mut bars: Vec<ProgressBar>,
 ) -> Result<()> {
   loop {
     if close.try_recv().is_ok() {
@@ -187,14 +220,11 @@ fn handle_bars(
       && let Some((n, status)) = *srx.borrow()
     {
       match status {
-        Status::Frame(frame) => bars[n].set_position(frame as u64),
+        Status::Frame(frame) => bars[n as usize].set_position(frame as u64),
         Status::Finish => {
-          bars[n].finish();
+          bars[n as usize].finish();
         }
         Status::None => {}
-      }
-      for bar in &mut bars {
-        bar.tick();
       }
     }
 
