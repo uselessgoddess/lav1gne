@@ -2,21 +2,28 @@
 #![feature(let_chains)]
 #![feature(try_blocks)]
 
-use anyhow::Result;
-use indicatif::{MultiProgress, ProgressBar};
-use reqwest::Client;
-use serde::Deserialize;
-use serde_json::json;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::str;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::{fs, io, thread};
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time;
+use {
+  anyhow::Result,
+  indicatif::{MultiProgress, ProgressBar},
+  reqwest::Client,
+  serde::Deserialize,
+  std::{
+    ffi::OsStr,
+    fs::{self, File},
+    future::Future,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    str,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+  },
+  tokio::{
+    sync::{mpsc, oneshot, watch},
+    time,
+  },
+};
 
 pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
   let mut cmd = Command::new(program);
@@ -24,7 +31,7 @@ pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
   cmd
 }
 
-fn video_frames(path: &str) -> u64 {
+fn video_frames(path: &Path) -> u64 {
   let output = command("ffprobe")
     .args([
       "-v",
@@ -36,8 +43,8 @@ fn video_frames(path: &str) -> u64 {
       "stream=nb_read_frames",
       "-of",
       "default=nokey=1:noprint_wrappers=1",
-      path,
     ])
+    .arg(path)
     .output()
     .unwrap();
 
@@ -45,12 +52,12 @@ fn video_frames(path: &str) -> u64 {
 }
 
 fn split_video(
-  input: &str, parts: usize,
+  input: &Path, parts: usize,
 ) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
   let duration_output = command("ffprobe")
+    .arg("-i")
+    .arg(input)
     .args([
-      "-i",
-      input,
       "-show_entries",
       "format=duration",
       "-v",
@@ -71,10 +78,9 @@ fn split_video(
     let start = segment * i as f64;
 
     let output = command("ffmpeg")
+      .args(["-y", "-i"])
+      .arg(input)
       .args([
-        "-y",
-        "-i",
-        input,
         "-ss",
         &start.to_string(),
         "-t",
@@ -97,14 +103,33 @@ pub enum Status {
   None,
 }
 
+use clap::Parser;
+
+#[derive(Parser)]
+struct Args {
+  input: PathBuf,
+
+  #[arg(short)]
+  output: PathBuf,
+
+  #[arg(short, value_delimiter = ' ', num_args = 1..)]
+  encoder: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
-  let server1 = (1, "http://127.0.0.1:3000");
-  let server2 = (1, "http://127.0.0.1:3001");
-  let servers = [server1, server2];
+  match entry(Args::parse()).await {
+    Ok(_) => {}
+    Err(err) => eprintln!("{err:?}"),
+  }
+}
+
+async fn entry(Args { input, output, encoder }: Args) -> Result<()> {
+  let servers = encoder.into_iter().map(|s| (1, s)).collect::<Vec<_>>();
+  let _ = File::open(&input)?;
 
   let (frames, parts): (Vec<_>, Vec<_>) =
-    split_video("zzz.mp4", servers.len()).unzip();
+    split_video(&input, servers.len()).unzip();
 
   let instant = Instant::now();
 
@@ -112,10 +137,11 @@ async fn main() {
   let (stx, mut srx) = watch::channel(None::<(u8, Status)>);
 
   let reqwest = Arc::new(Client::new());
-  for (i, (part, (threads, url))) in
+  for (i, (part, (threads, server))) in
     parts.into_iter().zip(servers.into_iter()).enumerate()
   {
     let (tx, client) = (tx.clone(), reqwest.clone());
+    let url = server.clone();
     tokio::spawn(async move {
       let result: Result<()> = try {
         let response = client
@@ -135,6 +161,7 @@ async fn main() {
     });
 
     let (stx, client) = (stx.clone(), reqwest.clone());
+    let url = server.clone();
     tokio::spawn(async move {
       loop {
         let mut wait = time::interval(Duration::from_millis(50));
@@ -180,14 +207,12 @@ async fn main() {
     parts.push(format!("{part}.ivf"));
   }
   let _ = closer.send(());
-  multi.clear().unwrap();
+  let _ = multi.clear();
 
   let list = generate_file_list(&parts, "list.txt");
   let status = command("ffmpeg")
-    .args([
-      "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
-      "out.mp4",
-    ])
+    .args(["-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy"])
+    .arg(output)
     .status()
     .expect("Failed to execute FFmpeg");
 
@@ -196,6 +221,8 @@ async fn main() {
   }
 
   println!("ELAPSED: {:?}", instant.elapsed());
+
+  Ok(())
 }
 
 fn generate_file_list(files: &[String], list_file: &str) {
